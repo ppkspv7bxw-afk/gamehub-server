@@ -6,7 +6,7 @@ const app = express();
 const server = http.createServer(app);
 
 const SITE_ORIGIN =
-  process.env.SITE_ORIGIN || "https://www.gamehub4u.com,https://gamehub4u.com";
+  process.env.SITE_ORIGIN || "https://gamehub4u.com,https://www.gamehub4u.com";
 const ALLOWED = SITE_ORIGIN.split(",").map((s) => s.trim()).filter(Boolean);
 
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
@@ -22,7 +22,7 @@ const io = new Server(server, {
 });
 
 io.on("connection", (socket) => {
-  // place your existing events here
+  // إذا عندك أحداث لعبتك القديمة، الصقها هنا مكان هذا التعليق
 });
 
 const PORT = process.env.PORT || 3000;
