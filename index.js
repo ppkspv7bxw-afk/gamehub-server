@@ -30,6 +30,101 @@ const io = new Server(httpServer, {
 const rooms = new Map();
 const players = new Map();
 
+// =============================
+// Mafia Engine (minimal v1)
+// =============================
+function shuffle(arr){
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function mafiaRolePlan(n){
+  // Simple & scalable:
+  // - mafia ≈ 1 per 3 players (min 1)
+  // - doctor + detective when n >= 5
+  const mafiaCount = Math.max(1, Math.floor(n / 3));
+  const hasSpecials = n >= 5;
+  const roles = [];
+  for (let i = 0; i < mafiaCount; i++) roles.push('mafia');
+  if (hasSpecials) roles.push('doctor', 'detective');
+  while (roles.length < n) roles.push('villager');
+  return shuffle(roles);
+}
+
+function ensureMafia(room){
+  if (!room.mafia) {
+    room.mafia = {
+      started: false,
+      phase: 'role',
+      round: 1,
+      // keyed by clientId
+      p: {},
+      // per-round buffers
+      night: { kills: {}, saves: {}, checks: {} },
+      votes: {},
+      lastResult: null,
+      winnerTeam: null
+    };
+  }
+  return room.mafia;
+}
+
+function publicMafiaState(room){
+  const m = ensureMafia(room);
+  const aliveArr = Object.values(m.p).map(x => ({
+    clientId: x.clientId,
+    name: x.name,
+    alive: x.alive
+  }));
+  return {
+    roomCode: room.code,
+    started: m.started,
+    phase: m.phase,
+    round: m.round,
+    alive: aliveArr,
+    lastResult: m.lastResult,
+    winnerTeam: m.winnerTeam
+  };
+}
+
+function stateForClient(room, clientId){
+  const m = ensureMafia(room);
+  const base = publicMafiaState(room);
+  const me = m.p[String(clientId || '')];
+  return {
+    ...base,
+    myRole: me ? me.role : null,
+    investigationResult: me ? me.investigationResult : null,
+    canAdvance: room.host === (room.clientToSocket?.get(room.hostClientId || '') || room.host)
+  };
+}
+
+function computeWinner(room){
+  const m = ensureMafia(room);
+  const alive = Object.values(m.p).filter(x => x.alive);
+  const mafiaAlive = alive.filter(x => x.role === 'mafia').length;
+  const townAlive = alive.filter(x => x.role !== 'mafia').length;
+  if (mafiaAlive === 0) return 'town';
+  if (mafiaAlive >= townAlive) return 'mafia';
+  return null;
+}
+
+function emitMafiaStateToRoom(io, room){
+  // Send personalized state per socket (so role is only seen by its owner)
+  const m = ensureMafia(room);
+  for (const pl of room.players) {
+    const sid = pl.id;
+    const cid = pl.clientId;
+    io.to(sid).emit('mafia:state', stateForClient(room, cid));
+    // Also re-send role privately if started
+    const me = m.p[cid];
+    if (m.started && me) io.to(sid).emit('mafia:role', { role: me.role });
+  }
+}
+
 // Helper Functions
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -54,9 +149,11 @@ function getRoomInfo(roomCode) {
     players: room.players.map(p => ({
       id: p.id,
       name: p.name,
-      isHost: p.id === room.host
+      isHost: p.id === room.host,
+      isReady: !!p.isReady
     })),
     status: room.status,
+    selectedGame: room.selectedGame || null,
     createdAt: room.createdAt
   };
 }
@@ -90,13 +187,27 @@ io.on('connection', (socket) => {
     console.log(`🎮 Host creating room:`, data);
     
     const roomCode = generateRoomCode();
+    const hostName = (data && data.name) ? String(data.name).trim() : 'Host';
+    const hostClientId = (data && data.clientId) ? String(data.clientId) : (socket.handshake.auth.clientId || socket.id);
+
     const room = {
       code: roomCode,
       host: socket.id,
-      players: [],
+      hostClientId: hostClientId,
+      clientToSocket: new Map([[hostClientId, socket.id]]),
+      players: [
+        {
+          id: socket.id,
+          clientId: hostClientId,
+          name: hostName || 'Host',
+          joinedAt: Date.now(),
+          isReady: false
+        }
+      ],
       status: 'waiting',
       createdAt: Date.now(),
-      gameData: null
+      gameData: null,
+      selectedGame: 'mafia'
     };
     
     rooms.set(roomCode, room);
@@ -107,6 +218,11 @@ io.on('connection', (socket) => {
     // إرسال الكود للـ Host
     socket.emit('host:roomCreated', { roomCode });
     socket.emit('room:created', { roomCode });
+
+    // Update room info for host UI immediately
+    const roomInfo = getRoomInfo(roomCode);
+    io.to(roomCode).emit('players:update', roomInfo);
+    io.to(roomCode).emit('room:update', roomInfo);
   });
 
   // ==========================================
@@ -141,12 +257,22 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Check if player already in room
-    const existingPlayer = room.players.find(p => p.id === socket.id || p.clientId === clientId);
+    // Ensure mapping exists
+    if (!room.clientToSocket) room.clientToSocket = new Map();
+
+    // Check if player already in room (by socket id or client id)
+    const existingPlayer = room.players.find(p => p.id === socket.id || (clientId && p.clientId === clientId));
     
     if (existingPlayer) {
       console.log(`⚠️  Player already in room: ${name}`);
       socket.join(roomCode);
+      // Refresh socket id on reconnect
+      if (clientId && existingPlayer.clientId === clientId && existingPlayer.id !== socket.id) {
+        room.clientToSocket.set(clientId, socket.id);
+        // If host was the old socket, migrate host to new socket
+        if (room.host === existingPlayer.id) room.host = socket.id;
+        existingPlayer.id = socket.id;
+      }
       socket.emit('player:joined', { roomCode, player: existingPlayer });
       return;
     }
@@ -161,6 +287,7 @@ io.on('connection', (socket) => {
     };
     
     room.players.push(player);
+    room.clientToSocket.set(player.clientId, socket.id);
     socket.join(roomCode);
     
     console.log(`✅ Player joined: ${name} → ${roomCode} (${room.players.length} players)`);
@@ -172,6 +299,60 @@ io.on('connection', (socket) => {
     const roomInfo = getRoomInfo(roomCode);
     io.to(roomCode).emit('players:update', roomInfo);
     io.to(roomCode).emit('room:update', roomInfo);
+  });
+
+  // ==========================================
+  // PLAYER: Ready / Unready
+  // ==========================================
+  socket.on('player:ready', (data) => {
+    const { roomCode, isReady } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const room = rooms.get(code);
+    if (!room) return;
+
+    const player = room.players.find(p => p.id === socket.id);
+    if (!player) return;
+
+    player.isReady = !!isReady;
+    console.log(`✅ Ready update: ${player.name} -> ${player.isReady} (${code})`);
+
+    const roomInfo = getRoomInfo(code);
+    io.to(code).emit('players:update', roomInfo);
+    io.to(code).emit('room:update', roomInfo);
+
+    // Optional convenience event
+    const allReady = room.players.length > 0 && room.players.every(p => p.isReady);
+    if (allReady) {
+      io.to(code).emit('room:allReady', { roomCode: code });
+    }
+  });
+
+  // ==========================================
+  // PLAYER: Attach (reconnect helper)
+  // ==========================================
+  socket.on('player:attach', (data) => {
+    const { roomCode, clientId } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const cid = String(clientId || '');
+    const room = rooms.get(code);
+    if (!room || !cid) return;
+    if (!room.clientToSocket) room.clientToSocket = new Map();
+
+    const pl = room.players.find(p => p.clientId === cid);
+    if (pl) {
+      const oldSid = pl.id;
+      pl.id = socket.id;
+      room.clientToSocket.set(cid, socket.id);
+      if (room.host === oldSid) room.host = socket.id;
+      socket.join(code);
+      const roomInfo = getRoomInfo(code);
+      io.to(code).emit('players:update', roomInfo);
+      io.to(code).emit('room:update', roomInfo);
+      // If a mafia game is running, re-send private role + state
+      if (room.mafia && room.mafia.started) {
+        emitMafiaStateToRoom(io, room);
+      }
+    }
   });
 
   // ==========================================
@@ -198,11 +379,34 @@ io.on('connection', (socket) => {
   });
 
   // ==========================================
+  // ROOM: Set Selected Game (Host only)
+  // ==========================================
+  socket.on('room:setGame', (data) => {
+    const { roomCode, gameId } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const room = rooms.get(code);
+    if (!room) return;
+
+    if (room.host !== socket.id) {
+      socket.emit('room:error', { message: 'فقط المستضيف يمكنه اختيار اللعبة' });
+      return;
+    }
+
+    room.selectedGame = String(gameId || '').trim() || 'mafia';
+    console.log("🎯 Selected game for " + code + ": " + room.selectedGame);
+
+    const roomInfo = getRoomInfo(code);
+    io.to(code).emit('room:update', roomInfo);
+  });
+
+
+// ==========================================
   // GAME: Start
   // ==========================================
   socket.on('game:start', (data) => {
     const { roomCode } = data;
-    const room = rooms.get(roomCode);
+    const code = String(roomCode || '').toUpperCase();
+    const room = rooms.get(code);
     
     if (!room) {
       socket.emit('game:error', { message: 'الغرفة غير موجودة' });
@@ -215,9 +419,157 @@ io.on('connection', (socket) => {
     }
     
     room.status = 'playing';
-    console.log(`🎮 Game started in room: ${roomCode}`);
-    
-    io.to(roomCode).emit('game:started', { roomCode });
+    console.log(`🎮 Game started in room: ${code}`);
+
+    const gameId = room.selectedGame || 'mafia';
+    // Initialize mafia engine when selected
+    if (gameId === 'mafia') {
+      const m = ensureMafia(room);
+      m.started = true;
+      m.phase = 'role';
+      m.round = 1;
+      m.lastResult = null;
+      m.winnerTeam = null;
+      m.night = { kills: {}, saves: {}, checks: {} };
+      m.votes = {};
+
+      // Create player table by clientId
+      const roles = mafiaRolePlan(room.players.length);
+      room.players.forEach((pl, idx) => {
+        m.p[pl.clientId] = {
+          clientId: pl.clientId,
+          name: pl.name,
+          alive: true,
+          role: roles[idx],
+          investigationResult: null
+        };
+        // PRIVATE: send role only to that player's socket
+        io.to(pl.id).emit('mafia:role', { role: roles[idx] });
+      });
+    }
+
+    io.to(code).emit('game:started', { roomCode: code, gameId });
+    // Also push mafia state to everyone (personalized per socket)
+    if ((room.selectedGame || 'mafia') === 'mafia') {
+      emitMafiaStateToRoom(io, room);
+    }
+  });
+
+  // ==========================================
+  // MAFIA: Get State (personalized)
+  // ==========================================
+  socket.on('mafia:getState', (data) => {
+    const { roomCode, clientId } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const cid = String(clientId || '');
+    const room = rooms.get(code);
+    if (!room) return;
+    ensureMafia(room);
+    socket.emit('mafia:state', stateForClient(room, cid));
+  });
+
+  // ==========================================
+  // MAFIA: Night Action
+  // ==========================================
+  socket.on('mafia:nightAction', (data) => {
+    const { roomCode, clientId, action, targetId } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const cid = String(clientId || '');
+    const tid = String(targetId || '');
+    const room = rooms.get(code);
+    if (!room) return;
+    const m = ensureMafia(room);
+    if (!m.started || m.winnerTeam) return;
+    if (m.phase !== 'night') return;
+    const me = m.p[cid];
+    if (!me || !me.alive) return;
+    const target = m.p[tid];
+    if (!target || !target.alive) return;
+
+    if (action === 'kill' && me.role === 'mafia') {
+      m.night.kills[cid] = tid;
+    } else if (action === 'save' && me.role === 'doctor') {
+      m.night.saves[cid] = tid;
+    } else if (action === 'check' && me.role === 'detective') {
+      m.night.checks[cid] = tid;
+      me.investigationResult = { targetId: tid, isMafia: target.role === 'mafia' };
+    } else {
+      return;
+    }
+
+    emitMafiaStateToRoom(io, room);
+  });
+
+  // ==========================================
+  // MAFIA: Vote
+  // ==========================================
+  socket.on('mafia:vote', (data) => {
+    const { roomCode, clientId, targetId } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const cid = String(clientId || '');
+    const tid = String(targetId || '');
+    const room = rooms.get(code);
+    if (!room) return;
+    const m = ensureMafia(room);
+    if (!m.started || m.winnerTeam) return;
+    if (m.phase !== 'day') return;
+    const me = m.p[cid];
+    const target = m.p[tid];
+    if (!me || !me.alive || !target || !target.alive) return;
+    m.votes[cid] = tid;
+    emitMafiaStateToRoom(io, room);
+  });
+
+  // ==========================================
+  // MAFIA: Next (Host only)
+  // ==========================================
+  socket.on('mafia:next', (data) => {
+    const { roomCode } = data || {};
+    const code = String(roomCode || '').toUpperCase();
+    const room = rooms.get(code);
+    if (!room) return;
+    if (room.host !== socket.id) return;
+    const m = ensureMafia(room);
+    if (!m.started || m.winnerTeam) return;
+
+    // role -> night -> day -> night ...
+    if (m.phase === 'role') {
+      m.phase = 'night';
+      m.lastResult = { phase: 'nightStart', round: m.round };
+    } else if (m.phase === 'night') {
+      // Resolve night
+      const killTargets = Object.values(m.night.kills);
+      const saveTargets = new Set(Object.values(m.night.saves));
+      let killed = null;
+      if (killTargets.length) {
+        // pick majority; fallback first
+        const counts = {};
+        for (const t of killTargets) counts[t] = (counts[t] || 0) + 1;
+        killed = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+        if (saveTargets.has(killed)) killed = null;
+      }
+      if (killed && m.p[killed]) m.p[killed].alive = false;
+      m.lastResult = { phase: 'nightEnd', killed, saved: [...saveTargets] };
+      m.night = { kills: {}, saves: {}, checks: {} };
+      m.phase = 'day';
+    } else if (m.phase === 'day') {
+      // Resolve votes
+      const votes = Object.values(m.votes);
+      let executed = null;
+      if (votes.length) {
+        const counts = {};
+        for (const t of votes) counts[t] = (counts[t] || 0) + 1;
+        executed = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0][0];
+      }
+      if (executed && m.p[executed]) m.p[executed].alive = false;
+      m.lastResult = { phase: 'dayEnd', executed, votesCount: votes.length };
+      m.votes = {};
+      m.round += 1;
+      m.phase = 'night';
+    }
+
+    m.winnerTeam = computeWinner(room);
+    emitMafiaStateToRoom(io, room);
   });
 
   // ==========================================
