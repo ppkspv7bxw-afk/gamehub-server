@@ -231,7 +231,7 @@ io.on('connection', (socket) => {
     };
     
     rooms.set(roomCode, room);
-    socket.join(code);
+    socket.join(roomCode);
     
     console.log(`✅ Room created: ${roomCode} by ${socket.id}`);
     
@@ -297,7 +297,7 @@ io.on('connection', (socket) => {
         if (room.host === existingPlayer.id) room.host = socket.id;
         existingPlayer.id = socket.id;
       }
-      socket.emit('player:joined', { roomCode, player: existingPlayer });
+      socket.emit('player:joined', { roomCode: code, player: existingPlayer });
       return;
     }
     
@@ -318,12 +318,12 @@ io.on('connection', (socket) => {
     console.log(`✅ Player joined: ${name} → ${roomCode} (${room.players.length} players)`);
     
     // Notify player
-    socket.emit('player:joined', { roomCode, player });
-    
+    socket.emit('player:joined', { roomCode: code, player });
+
     // Notify everyone in room
-    const roomInfo = getRoomInfo(roomCode);
-    io.to(roomCode).emit('players:update', roomInfo);
-    io.to(roomCode).emit('room:update', roomInfo);
+    const roomInfo = getRoomInfo(code);
+    io.to(code).emit('players:update', roomInfo);
+    io.to(code).emit('room:update', roomInfo);
   });
 
   // ==========================================
@@ -388,15 +388,15 @@ io.on('connection', (socket) => {
   // Alternative join events (للتوافق)
   // ==========================================
   socket.on('join:room', (data) => {
-    socket.emit('player:join', data);
+    socket.listeners('player:join')[0]?.(data);
   });
-  
+
   socket.on('room:join', (data) => {
-    socket.emit('player:join', data);
+    socket.listeners('player:join')[0]?.(data);
   });
 
   socket.on('join', (data) => {
-    socket.emit('player:join', data);
+    socket.listeners('player:join')[0]?.(data);
   });
 
   // ==========================================
@@ -562,7 +562,8 @@ io.on('connection', (socket) => {
     const code = String(roomCode || '').toUpperCase();
     const room = rooms.get(code);
     if (!room) return;
-    if (room.host !== socket.id) return;
+    const callerCid = getClientIdFrom(socket, data);
+    if (room.hostClientId ? callerCid !== room.hostClientId : room.host !== socket.id) return;
     const m = ensureMafia(room);
     if (!m.started || m.winnerTeam) return;
 
@@ -675,22 +676,42 @@ io.on('connection', (socket) => {
 function handlePlayerLeave(socket, roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
-  
+
   const playerIndex = room.players.findIndex(p => p.id === socket.id);
   if (playerIndex === -1) return;
-  
+
   const player = room.players[playerIndex];
   room.players.splice(playerIndex, 1);
+  if (room.clientToSocket) room.clientToSocket.delete(String(player.clientId || ''));
   socket.leave(roomCode);
-  
+
   console.log(`👋 ${player.name} left room ${roomCode}`);
-  
+
+  if (room.players.length === 0) {
+    rooms.delete(roomCode);
+    console.log(`🗑️  Room deleted: ${roomCode} (empty)`);
+    return;
+  }
+
+  // Reassign host if needed
+  if (room.host === socket.id) {
+    if (room.hostClientId) {
+      const newHost = room.players.find(p => p.clientId === room.hostClientId);
+      room.host = newHost ? newHost.id : room.players[0].id;
+      if (!newHost) room.hostClientId = room.players[0].clientId;
+    } else {
+      room.host = room.players[0].id;
+    }
+    console.log(`👑 New host assigned in ${roomCode}`);
+  }
+
   // Notify others
   const roomInfo = getRoomInfo(roomCode);
   io.to(roomCode).emit('players:update', roomInfo);
-  io.to(roomCode).emit('player:left', { 
+  io.to(roomCode).emit('room:update', roomInfo);
+  io.to(roomCode).emit('player:left', {
     playerId: socket.id,
-    playerName: player.name 
+    playerName: player.name
   });
 }
 
