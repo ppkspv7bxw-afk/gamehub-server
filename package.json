@@ -1,14 +1,19 @@
 {
   "name": "gamehub-server",
-  "version": "2.0.0",
-  "description": "Gamehub4u Game Server",
+  "version": "2.1.0",
+  "description": "Gamehub4u Socket.IO game server",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "check": "node --check index.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "socket.io": "^4.6.1",
-    "cors": "^2.8.5"
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.7.5"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
