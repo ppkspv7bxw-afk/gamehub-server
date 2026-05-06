@@ -232,11 +232,17 @@ function startGame(socket, data = {}) {
     room.players.forEach((pl, idx) => {
       m.p[pl.clientId] = { clientId: pl.clientId, name: pl.name, alive: true, role: roles[idx], investigationResult: null };
     });
+  } else if (gameId === 'out-of-loop') {
+    if (!outloopStart(room, data)) return socket.emit('game:error', { message: 'Out of the Loop تحتاج 3 لاعبين أو فعّل Dev Mode للتجربة' });
+  } else if (gameId === 'conqueror') {
+    if (!conqStart(room)) return socket.emit('game:error', { message: 'Conqueror تحتاج لاعبين أو فعّل Dev Mode للتجربة' });
   }
 
   io.to(code).emit('game:started', { roomCode: code, gameId });
   emitRoom(room);
   if (gameId === 'mafia') emitMafiaState(room);
+  if (gameId === 'out-of-loop') emitOutloop(room);
+  if (gameId === 'conqueror') emitConq(room);
 }
 
 function resolveMafiaNext(socket, data = {}) {
@@ -299,6 +305,10 @@ function resetToLobby(socket, data = {}) {
   room.status = 'waiting';
   room.players.forEach((p) => { p.isReady = false; });
   room.mafia = null;
+  if (room.outloop?.timer) clearInterval(room.outloop.timer);
+  room.outloop = null;
+  if (room.conqueror?.resourceTimer) clearInterval(room.conqueror.resourceTimer);
+  room.conqueror = null;
   emitRoom(room);
   io.to(code).emit('lobby:reset', { roomCode: code });
 }
@@ -675,6 +685,241 @@ mafiaGWss.on('connection', (ws) => {
   });
 });
 
+
+// =============================
+// Out of the Loop engine
+// =============================
+const OUTLOOP_CATEGORIES = [
+  { id: 'food', name: 'أكل ومطاعم', words: ['بيتزا','برجر','كبسة','سوشي','قهوة','شاورما','آيس كريم','باستا'] },
+  { id: 'places', name: 'أماكن', words: ['مطار','مدرسة','مستشفى','استراحة','ملعب','مول','فندق','شاطئ'] },
+  { id: 'things', name: 'أشياء', words: ['جوال','سيارة','ساعة','مفتاح','شنطة','كرسي','كاميرا','ريموت'] },
+  { id: 'animals', name: 'حيوانات', words: ['أسد','قط','كلب','نمر','حصان','جمل','بطريق','دولفين'] },
+];
+
+function ensureOutloop(room) {
+  if (!room.outloop) {
+    room.outloop = {
+      phase: 'lobby',
+      players: [],
+      categoryId: 'food',
+      selectedWord: '',
+      outsiderId: '',
+      revealIndex: 0,
+      timeLeft: 120,
+      votes: {},
+      result: null,
+      timer: null,
+    };
+  }
+  return room.outloop;
+}
+
+function outloopPlayers(room) {
+  const o = ensureOutloop(room);
+  const byId = new Map(o.players.map((p) => [p.clientId, p]));
+  const live = room.players.map((p) => {
+    const old = byId.get(p.clientId);
+    return { clientId: p.clientId, name: p.name, isBot: false, connected: p.connected !== false, role: old?.role || 'inside' };
+  });
+  const bots = o.players.filter((p) => p.isBot);
+  o.players = [...live, ...bots];
+  return o.players;
+}
+
+function publicOutloopState(room, clientId = '') {
+  const o = ensureOutloop(room);
+  const players = outloopPlayers(room);
+  const me = players.find((p) => p.clientId === clientId);
+  const revealPlayer = players[o.revealIndex] || null;
+  const shouldRevealMine = o.phase === 'reveal' && revealPlayer && revealPlayer.clientId === clientId;
+  const result = o.result ? { ...o.result } : null;
+  return {
+    roomCode: room.code,
+    isHost: String(clientId) === String(room.hostClientId),
+    phase: o.phase,
+    players: players.map((p) => ({ clientId: p.clientId, name: p.name, isBot: !!p.isBot, connected: p.connected !== false })),
+    categories: OUTLOOP_CATEGORIES.map(({ id, name }) => ({ id, name })),
+    categoryId: o.categoryId,
+    revealIndex: o.revealIndex,
+    revealPlayerId: revealPlayer?.clientId || null,
+    timeLeft: o.timeLeft,
+    votes: o.votes,
+    myRole: me?.role || null,
+    myWord: shouldRevealMine && me?.role === 'inside' ? o.selectedWord : (shouldRevealMine ? 'أنت برا السالفة' : null),
+    result,
+  };
+}
+
+function emitOutloop(room) {
+  for (const p of room.players) io.to(p.socketId).emit('outloop:state', publicOutloopState(room, p.clientId));
+  const o = ensureOutloop(room);
+  for (const bot of o.players.filter((x) => x.isBot)) {}
+  io.to(room.code).emit('outloop:publicState', publicOutloopState(room, ''));
+}
+
+function outloopStopTimer(o) {
+  if (o.timer) clearInterval(o.timer);
+  o.timer = null;
+}
+
+function outloopStartTimer(room) {
+  const o = ensureOutloop(room);
+  outloopStopTimer(o);
+  o.timer = setInterval(() => {
+    const r = rooms.get(room.code);
+    if (!r) return outloopStopTimer(o);
+    const state = ensureOutloop(r);
+    if (state.phase !== 'playing') return outloopStopTimer(state);
+    state.timeLeft -= 1;
+    if (state.timeLeft <= 0) {
+      state.timeLeft = 0;
+      state.phase = 'voting';
+      outloopStopTimer(state);
+      emitOutloop(r);
+      return;
+    }
+    io.to(r.code).emit('outloop:timer', { timeLeft: state.timeLeft });
+  }, 1000);
+}
+
+function outloopStart(room, data = {}) {
+  const o = ensureOutloop(room);
+  outloopStopTimer(o);
+  o.phase = 'reveal';
+  o.players = outloopPlayers(room);
+  if (room.devMode && o.players.length < 3) {
+    while (o.players.length < 3) o.players.push({ clientId: 'out-bot-' + Math.random().toString(36).slice(2), name: 'بوت ' + (o.players.length + 1), isBot: true, role: 'inside', connected: true });
+  }
+  if (o.players.length < 3) return false;
+  const cat = OUTLOOP_CATEGORIES.find((c) => c.id === (data.categoryId || o.categoryId)) || OUTLOOP_CATEGORIES[0];
+  o.categoryId = cat.id;
+  o.selectedWord = cat.words[Math.floor(Math.random() * cat.words.length)];
+  const outsider = o.players[Math.floor(Math.random() * o.players.length)];
+  o.players.forEach((p) => { p.role = p.clientId === outsider.clientId ? 'outside' : 'inside'; });
+  o.outsiderId = outsider.clientId;
+  o.revealIndex = 0;
+  o.timeLeft = Number(data.timeLeft || 120);
+  o.votes = {};
+  o.result = null;
+  return true;
+}
+
+function outloopFinishVote(room, votedId) {
+  const o = ensureOutloop(room);
+  const players = outloopPlayers(room);
+  const caught = String(votedId) === String(o.outsiderId);
+  o.phase = 'result';
+  o.result = {
+    votedId,
+    outsiderId: o.outsiderId,
+    outsiderName: players.find((p) => p.clientId === o.outsiderId)?.name || 'Unknown',
+    word: o.selectedWord,
+    caught,
+    winnerTeam: caught ? 'inside' : 'outside',
+  };
+  if (caught) {
+    players.filter((p) => p.role === 'inside' && !p.isBot).forEach((winner) => {
+      const hp = room.players.find((p) => p.clientId === winner.clientId);
+      if (hp) hp.score = Number(hp.score || 0) + 1;
+    });
+  } else {
+    const hp = room.players.find((p) => p.clientId === o.outsiderId);
+    if (hp) hp.score = Number(hp.score || 0) + 1;
+  }
+  room.status = 'finished';
+  emitRoom(room);
+}
+
+// =============================
+// Conqueror engine
+// =============================
+const CONQ_COLORS = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899', '#06b6d4', '#f97316'];
+function conqMap() {
+  return {
+    t1: { id: 't1', name: 'Northlands', ownerId: null, armies: 0, neighbors: ['t2','t4'], type: 'mountain' },
+    t2: { id: 't2', name: 'Green Valley', ownerId: null, armies: 0, neighbors: ['t1','t3','t5'], type: 'forest' },
+    t3: { id: 't3', name: 'East Coast', ownerId: null, armies: 0, neighbors: ['t2','t6'], type: 'plains' },
+    t4: { id: 't4', name: 'West Reach', ownerId: null, armies: 0, neighbors: ['t1','t5','t7'], type: 'plains' },
+    t5: { id: 't5', name: 'Central Hub', ownerId: null, armies: 0, neighbors: ['t2','t4','t6','t8'], type: 'plains' },
+    t6: { id: 't6', name: 'Shadow Woods', ownerId: null, armies: 0, neighbors: ['t3','t5','t9'], type: 'forest' },
+    t7: { id: 't7', name: 'South Peak', ownerId: null, armies: 0, neighbors: ['t4','t8'], type: 'mountain' },
+    t8: { id: 't8', name: 'Iron Hills', ownerId: null, armies: 0, neighbors: ['t5','t7','t9'], type: 'mountain' },
+    t9: { id: 't9', name: 'Sunken Marsh', ownerId: null, armies: 0, neighbors: ['t6','t8'], type: 'forest' },
+  };
+}
+function ensureConqueror(room) {
+  if (!room.conqueror) room.conqueror = { status: 'lobby', players: {}, territories: conqMap(), turn: 0, winnerId: null, resourceTimer: null };
+  return room.conqueror;
+}
+function conqSyncPlayers(room) {
+  const c = ensureConqueror(room);
+  room.players.forEach((p, idx) => {
+    if (!c.players[p.clientId]) c.players[p.clientId] = { id: p.clientId, name: p.name, color: CONQ_COLORS[idx % CONQ_COLORS.length], resources: { gold: 100, wood: 50, iron: 50 }, armies: 10 };
+    c.players[p.clientId].name = p.name;
+  });
+  Object.keys(c.players).forEach((id) => {
+    if (!room.players.some((p) => p.clientId === id) && !id.startsWith('conq-bot-')) delete c.players[id];
+  });
+  return c;
+}
+function publicConqState(room, clientId = '') {
+  const c = conqSyncPlayers(room);
+  return { roomCode: room.code, isHost: String(clientId) === String(room.hostClientId), status: c.status, players: c.players, territories: c.territories, turn: c.turn, winnerId: c.winnerId };
+}
+function emitConq(room) {
+  for (const p of room.players) io.to(p.socketId).emit('conqueror:state', publicConqState(room, p.clientId));
+  io.to(room.code).emit('conqueror:publicState', publicConqState(room, ''));
+}
+function conqStart(room) {
+  const c = ensureConqueror(room);
+  conqSyncPlayers(room);
+  if (room.devMode && Object.keys(c.players).length < 2) {
+    const id = 'conq-bot-' + Math.random().toString(36).slice(2);
+    c.players[id] = { id, name: 'Bot Commander', color: CONQ_COLORS[1], resources: { gold: 100, wood: 50, iron: 50 }, armies: 10 };
+  }
+  if (Object.keys(c.players).length < 2) return false;
+  c.status = 'playing';
+  c.territories = conqMap();
+  c.turn = 0;
+  c.winnerId = null;
+  const territoryIds = Object.keys(c.territories);
+  Object.keys(c.players).forEach((pid, idx) => {
+    const t = c.territories[territoryIds[idx % territoryIds.length]];
+    t.ownerId = pid;
+    t.armies = 5;
+  });
+  if (c.resourceTimer) clearInterval(c.resourceTimer);
+  c.resourceTimer = setInterval(() => {
+    const r = rooms.get(room.code);
+    if (!r) return clearInterval(c.resourceTimer);
+    const state = ensureConqueror(r);
+    if (state.status !== 'playing') return;
+    Object.values(state.players).forEach((player) => {
+      player.resources.gold += 5;
+      const owned = Object.values(state.territories).filter((t) => t.ownerId === player.id);
+      player.resources.gold += owned.length * 2;
+      owned.forEach((t) => {
+        if (t.type === 'forest') player.resources.wood += 2;
+        if (t.type === 'mountain') player.resources.iron += 2;
+        if (t.type === 'plains') player.resources.gold += 1;
+      });
+    });
+    emitConq(r);
+  }, 5000);
+  return true;
+}
+function conqCheckWinner(room) {
+  const c = ensureConqueror(room);
+  const totals = {};
+  Object.values(c.territories).forEach((t) => { if (t.ownerId) totals[t.ownerId] = (totals[t.ownerId] || 0) + 1; });
+  const top = Object.entries(totals).sort((a,b)=>b[1]-a[1])[0];
+  if (top && top[1] >= Object.keys(c.territories).length) {
+    c.status = 'ended'; c.winnerId = top[0]; room.status = 'finished';
+    const hp = room.players.find((p) => p.clientId === c.winnerId); if (hp) hp.score = Number(hp.score || 0) + 1;
+    emitRoom(room);
+  }
+}
+
 io.on('connection', (socket) => {
   const baseClientId = getClientId(socket);
   sockets.set(socket.id, { clientId: baseClientId, socket });
@@ -824,6 +1069,125 @@ io.on('connection', (socket) => {
   socket.on('game:start', (data = {}) => startGame(socket, data));
   socket.on('mafia:start', (data = {}) => startGame(socket, { ...data, gameId: 'mafia' }));
   socket.on('lobby:reset', (data = {}) => resetToLobby(socket, data));
+
+
+  socket.on('outloop:getState', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room) return;
+    socket.emit('outloop:state', publicOutloopState(room, getClientId(socket, data)));
+  });
+
+  socket.on('outloop:setCategory', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    const o = ensureOutloop(room);
+    if (OUTLOOP_CATEGORIES.some((c) => c.id === data.categoryId)) o.categoryId = data.categoryId;
+    emitOutloop(room);
+  });
+
+  socket.on('outloop:start', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    room.selectedGame = 'out-of-loop';
+    room.status = 'playing';
+    if (!outloopStart(room, data)) return socket.emit('game:error', { message: 'تحتاج 3 لاعبين أو فعّل Dev Mode' });
+    io.to(room.code).emit('game:started', { roomCode: room.code, gameId: 'out-of-loop' });
+    emitRoom(room); emitOutloop(room);
+  });
+
+  socket.on('outloop:nextReveal', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room) return;
+    const o = ensureOutloop(room);
+    const players = outloopPlayers(room);
+    if (o.phase !== 'reveal') return;
+    if (o.revealIndex < players.length - 1) o.revealIndex += 1;
+    else { o.phase = 'playing'; outloopStartTimer(room); }
+    emitOutloop(room);
+  });
+
+  socket.on('outloop:voteStart', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    const o = ensureOutloop(room);
+    o.phase = 'voting'; outloopStopTimer(o); emitOutloop(room);
+  });
+
+  socket.on('outloop:vote', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room) return;
+    const o = ensureOutloop(room);
+    if (o.phase !== 'voting') return;
+    const cid = getClientId(socket, data);
+    const targetId = String(data.targetId || '');
+    o.votes[cid] = targetId;
+    const realPlayers = outloopPlayers(room).filter((p) => !p.isBot);
+    if (Object.keys(o.votes).length >= Math.max(1, realPlayers.length)) {
+      const counts = {};
+      Object.values(o.votes).forEach((v) => { counts[v] = (counts[v] || 0) + 1; });
+      const votedId = Object.entries(counts).sort((a,b)=>b[1]-a[1])[0]?.[0] || targetId;
+      outloopFinishVote(room, votedId);
+    }
+    emitOutloop(room);
+  });
+
+  socket.on('outloop:reset', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    const o = ensureOutloop(room); outloopStopTimer(o); room.outloop = null; room.status = 'waiting'; emitRoom(room); emitOutloop(room);
+  });
+
+  socket.on('conqueror:getState', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room) return;
+    socket.emit('conqueror:state', publicConqState(room, getClientId(socket, data)));
+  });
+
+  socket.on('conqueror:start', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    room.selectedGame = 'conqueror'; room.status = 'playing';
+    if (!conqStart(room)) return socket.emit('game:error', { message: 'Conqueror تحتاج لاعبين أو Dev Mode' });
+    io.to(room.code).emit('game:started', { roomCode: room.code, gameId: 'conqueror' });
+    emitRoom(room); emitConq(room);
+  });
+
+  socket.on('conqueror:recruit', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode)); if (!room) return;
+    const c = ensureConqueror(room); const cid = getClientId(socket, data); const p = c.players[cid];
+    const count = Math.max(1, Math.min(20, Number(data.count || 1))); const cost = count * 10;
+    if (p && p.resources.gold >= cost) { p.resources.gold -= cost; p.armies += count; emitConq(room); }
+  });
+
+  socket.on('conqueror:capture', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode)); if (!room) return;
+    const c = ensureConqueror(room); if (c.status !== 'playing') return;
+    const cid = getClientId(socket, data); const p = c.players[cid]; const t = c.territories[String(data.territoryId || '')];
+    if (!p || !t) return;
+    if (t.ownerId === cid) { if (p.armies > 0) { p.armies -= 1; t.armies += 1; } }
+    else if (!t.ownerId && p.armies > 0) { t.ownerId = cid; t.armies = 1; p.armies -= 1; }
+    else if (t.ownerId !== cid) {
+      const adjacent = Object.values(c.territories).some((x) => x.ownerId === cid && x.neighbors.includes(t.id));
+      if (adjacent && p.armies > 1) {
+        if (p.armies > t.armies) { p.armies -= (t.armies + 1); t.ownerId = cid; t.armies = 1; }
+        else { t.armies = Math.max(1, t.armies - (p.armies - 1)); p.armies = 1; }
+      }
+    }
+    conqCheckWinner(room); emitConq(room);
+  });
+
+  socket.on('conqueror:finish', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode)); if (!room || !isHost(room, socket, data)) return;
+    const c = ensureConqueror(room); const totals = {};
+    Object.values(c.territories).forEach((t) => { if (t.ownerId) totals[t.ownerId] = (totals[t.ownerId] || 0) + 1; });
+    const winner = Object.entries(totals).sort((a,b)=>b[1]-a[1])[0]?.[0];
+    if (winner) { c.status = 'ended'; c.winnerId = winner; room.status = 'finished'; const hp = room.players.find((p)=>p.clientId===winner); if (hp) hp.score = Number(hp.score||0)+1; emitRoom(room); emitConq(room); }
+  });
+
+  socket.on('conqueror:reset', (data = {}) => {
+    const room = rooms.get(normRoomCode(data.roomCode)); if (!room || !isHost(room, socket, data)) return;
+    const c = ensureConqueror(room); if (c.resourceTimer) clearInterval(c.resourceTimer); room.conqueror = null; room.status = 'waiting'; emitRoom(room); emitConq(room);
+  });
 
   socket.on('mafia:getState', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
