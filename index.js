@@ -1016,6 +1016,8 @@ io.on('connection', (socket) => {
       socket.emit('player:joined', { roomCode: code, player });
       emitRoom(room);
       if (room.mafia?.started) emitMafiaState(room);
+      if (room.outloop) emitOutloop(room);
+      if (room.conqueror) emitConq(room);
     }
   });
 
@@ -1073,7 +1075,9 @@ io.on('connection', (socket) => {
 
   socket.on('outloop:getState', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
-    if (!room) return;
+    if (!room) return socket.emit('game:error', { message: 'الغرفة غير موجودة' });
+    socket.join(room.code);
+    socket.emit('room:state', roomInfo(room));
     socket.emit('outloop:state', publicOutloopState(room, getClientId(socket, data)));
   });
 
@@ -1089,8 +1093,9 @@ io.on('connection', (socket) => {
     const room = rooms.get(normRoomCode(data.roomCode));
     if (!room || !isHost(room, socket, data)) return;
     room.selectedGame = 'out-of-loop';
+    const prevStatus = room.status;
     room.status = 'playing';
-    if (!outloopStart(room, data)) return socket.emit('game:error', { message: 'تحتاج 3 لاعبين أو فعّل Dev Mode' });
+    if (!outloopStart(room, data)) { room.status = prevStatus; emitRoom(room); return socket.emit('game:error', { message: 'تحتاج 3 لاعبين أو فعّل Dev Mode' }); }
     io.to(room.code).emit('game:started', { roomCode: room.code, gameId: 'out-of-loop' });
     emitRoom(room); emitOutloop(room);
   });
@@ -1139,15 +1144,17 @@ io.on('connection', (socket) => {
 
   socket.on('conqueror:getState', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
-    if (!room) return;
+    if (!room) return socket.emit('game:error', { message: 'الغرفة غير موجودة' });
+    socket.join(room.code);
+    socket.emit('room:state', roomInfo(room));
     socket.emit('conqueror:state', publicConqState(room, getClientId(socket, data)));
   });
 
   socket.on('conqueror:start', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
     if (!room || !isHost(room, socket, data)) return;
-    room.selectedGame = 'conqueror'; room.status = 'playing';
-    if (!conqStart(room)) return socket.emit('game:error', { message: 'Conqueror تحتاج لاعبين أو Dev Mode' });
+    room.selectedGame = 'conqueror'; const prevStatus = room.status; room.status = 'playing';
+    if (!conqStart(room)) { room.status = prevStatus; emitRoom(room); return socket.emit('game:error', { message: 'Conqueror تحتاج لاعبين أو Dev Mode' }); }
     io.to(room.code).emit('game:started', { roomCode: room.code, gameId: 'conqueror' });
     emitRoom(room); emitConq(room);
   });
@@ -1191,7 +1198,9 @@ io.on('connection', (socket) => {
 
   socket.on('mafia:getState', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
-    if (!room) return;
+    if (!room) return socket.emit('game:error', { message: 'الغرفة غير موجودة' });
+    socket.join(room.code);
+    socket.emit('room:state', roomInfo(room));
     socket.emit('mafia:state', stateForClient(room, getClientId(socket, data)));
   });
 
