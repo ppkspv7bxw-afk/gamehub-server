@@ -752,8 +752,6 @@ function publicOutloopState(room, clientId = '') {
 
 function emitOutloop(room) {
   for (const p of room.players) io.to(p.socketId).emit('outloop:state', publicOutloopState(room, p.clientId));
-  const o = ensureOutloop(room);
-  for (const bot of o.players.filter((x) => x.isBot)) {}
   io.to(room.code).emit('outloop:publicState', publicOutloopState(room, ''));
 }
 
