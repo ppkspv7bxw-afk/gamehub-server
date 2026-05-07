@@ -1005,10 +1005,28 @@ io.on('connection', (socket) => {
     const room = rooms.get(code);
     if (!room) return;
     const clientId = getClientId(socket, data);
-    const player = room.players.find((p) => p.clientId === clientId);
+    let player = room.players.find((p) => p.clientId === clientId);
+
+    // If the browser reached the lobby/game page but the previous join packet was lost,
+    // attach should still keep the player visible in the room instead of leaving them invisible.
+    if (!player && room.status === 'waiting') {
+      if (room.players.length >= MAX_PLAYERS) return socket.emit('join:error', { message: `الغرفة ممتلئة (${MAX_PLAYERS})` });
+      player = {
+        socketId: socket.id,
+        clientId,
+        name: safeName(data.name, clientId === room.hostClientId ? 'Host' : 'لاعب'),
+        isReady: false,
+        connected: true,
+        joinedAt: Date.now(),
+        score: 0,
+      };
+      room.players.push(player);
+    }
+
     if (player) {
       player.socketId = socket.id;
       player.connected = true;
+      if (data.name) player.name = safeName(data.name, player.name);
       if (player.clientId === room.hostClientId) room.hostSocketId = socket.id;
       socket.join(code);
       socket.emit('player:joined', { roomCode: code, player });
@@ -1282,6 +1300,7 @@ io.on('connection', (socket) => {
     const player = room.players.find((p) => p.socketId === socket.id);
     if (!player) return;
     player.connected = false;
+    if (player.clientId === room.hostClientId) transferHostIfNeeded(room);
 
     if (!disconnectTimers.has(room.code)) disconnectTimers.set(room.code, new Map());
     const timers = disconnectTimers.get(room.code);
