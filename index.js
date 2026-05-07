@@ -732,8 +732,8 @@ function publicOutloopState(room, clientId = '') {
   const players = outloopPlayers(room);
   const me = players.find((p) => p.clientId === clientId);
   const revealPlayer = players[o.revealIndex] || null;
-  const shouldRevealMine = o.phase === 'reveal' && revealPlayer && revealPlayer.clientId === clientId;
   const result = o.result ? { ...o.result } : null;
+  const isRevealPhase = o.phase === 'reveal';
   return {
     roomCode: room.code,
     isHost: String(clientId) === String(room.hostClientId),
@@ -746,7 +746,9 @@ function publicOutloopState(room, clientId = '') {
     timeLeft: o.timeLeft,
     votes: o.votes,
     myRole: me?.role || null,
-    myWord: shouldRevealMine && me?.role === 'inside' ? o.selectedWord : (shouldRevealMine ? 'أنت برا السالفة' : null),
+    // Mobile-friendly reveal: every player sees only their own word/outsider card.
+    // This avoids the old pass-the-device flow that made the game feel broken online.
+    myWord: isRevealPhase && me?.role === 'inside' ? o.selectedWord : (isRevealPhase && me ? 'أنت برا السالفة' : null),
     result,
   };
 }
@@ -786,10 +788,11 @@ function outloopStart(room, data = {}) {
   outloopStopTimer(o);
   o.phase = 'reveal';
   o.players = outloopPlayers(room);
-  if (room.devMode && o.players.length < 3) {
-    while (o.players.length < 3) o.players.push({ clientId: 'out-bot-' + Math.random().toString(36).slice(2), name: 'بوت ' + (o.players.length + 1), isBot: true, role: 'inside', connected: true });
+  // Auto-fill lightweight bots when there are not enough players, so testing with 1-2 players works.
+  // Real players still get lobby scores; bots are ignored for scoring.
+  while (o.players.length < 3) {
+    o.players.push({ clientId: 'out-bot-' + Math.random().toString(36).slice(2), name: 'بوت ' + (o.players.length + 1), isBot: true, role: 'inside', connected: true });
   }
-  if (o.players.length < 3) return false;
   const cat = OUTLOOP_CATEGORIES.find((c) => c.id === (data.categoryId || o.categoryId)) || OUTLOOP_CATEGORIES[0];
   o.categoryId = cat.id;
   o.selectedWord = cat.words[Math.floor(Math.random() * cat.words.length)];
@@ -872,11 +875,11 @@ function emitConq(room) {
 function conqStart(room) {
   const c = ensureConqueror(room);
   conqSyncPlayers(room);
-  if (room.devMode && Object.keys(c.players).length < 2) {
+  // Auto-fill one bot when needed, so Conqueror can be tested without a second real device.
+  if (Object.keys(c.players).length < 2) {
     const id = 'conq-bot-' + Math.random().toString(36).slice(2);
     c.players[id] = { id, name: 'Bot Commander', color: CONQ_COLORS[1], resources: { gold: 100, wood: 50, iron: 50 }, armies: 10 };
   }
-  if (Object.keys(c.players).length < 2) return false;
   c.status = 'playing';
   c.territories = conqMap();
   c.turn = 0;
@@ -1118,12 +1121,11 @@ io.on('connection', (socket) => {
 
   socket.on('outloop:nextReveal', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
-    if (!room) return;
+    if (!room || !isHost(room, socket, data)) return;
     const o = ensureOutloop(room);
-    const players = outloopPlayers(room);
     if (o.phase !== 'reveal') return;
-    if (o.revealIndex < players.length - 1) o.revealIndex += 1;
-    else { o.phase = 'playing'; outloopStartTimer(room); }
+    o.phase = 'playing';
+    outloopStartTimer(room);
     emitOutloop(room);
   });
 
