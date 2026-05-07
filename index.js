@@ -125,6 +125,7 @@ function transferHostIfNeeded(room) {
   if (next) {
     room.hostClientId = next.clientId;
     room.hostSocketId = next.socketId;
+    io.to(room.code).emit('host:changed', { newHostClientId: next.clientId, newHostName: next.name });
   }
 }
 
@@ -926,12 +927,11 @@ io.on('connection', (socket) => {
   socket.on('host:createRoom', (data = {}) => {
     const code = generateRoomCode();
     const hostClientId = getClientId(socket, data);
-    const hostName = safeName(data.name, 'Host');
     const room = {
       code,
       hostSocketId: socket.id,
       hostClientId,
-      players: [{ socketId: socket.id, clientId: hostClientId, name: hostName, isReady: true, connected: true, joinedAt: Date.now(), score: 0 }],
+      players: [],
       status: 'waiting',
       selectedGame: 'mafia',
       devMode: false,
@@ -1137,7 +1137,13 @@ io.on('connection', (socket) => {
   socket.on('outloop:reset', (data = {}) => {
     const room = rooms.get(normRoomCode(data.roomCode));
     if (!room || !isHost(room, socket, data)) return;
-    const o = ensureOutloop(room); outloopStopTimer(o); room.outloop = null; room.status = 'waiting'; emitRoom(room); emitOutloop(room);
+    const o = ensureOutloop(room);
+    outloopStopTimer(o);
+    room.outloop = null;
+    room.status = 'waiting';
+    room.players.forEach((p) => { p.isReady = false; });
+    emitRoom(room);
+    io.to(room.code).emit('lobby:reset', { roomCode: room.code });
   });
 
   socket.on('conqueror:getState', (data = {}) => {
@@ -1190,8 +1196,15 @@ io.on('connection', (socket) => {
   });
 
   socket.on('conqueror:reset', (data = {}) => {
-    const room = rooms.get(normRoomCode(data.roomCode)); if (!room || !isHost(room, socket, data)) return;
-    const c = ensureConqueror(room); if (c.resourceTimer) clearInterval(c.resourceTimer); room.conqueror = null; room.status = 'waiting'; emitRoom(room); emitConq(room);
+    const room = rooms.get(normRoomCode(data.roomCode));
+    if (!room || !isHost(room, socket, data)) return;
+    const c = ensureConqueror(room);
+    if (c.resourceTimer) clearInterval(c.resourceTimer);
+    room.conqueror = null;
+    room.status = 'waiting';
+    room.players.forEach((p) => { p.isReady = false; });
+    emitRoom(room);
+    io.to(room.code).emit('lobby:reset', { roomCode: room.code });
   });
 
   socket.on('mafia:getState', (data = {}) => {
